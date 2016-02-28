@@ -1,0 +1,297 @@
+---
+title: "Web scraping: hop data from YCH Hops"
+author: "Christopher Swingley"
+date: "2016-02-16"
+output:
+  pdf_document:
+    highlight: default
+    includes:
+      in_header: ~/docs/rmarkdown/rmarkdown_tex_preamble.tex
+    keep_tex: yes
+    latex_engine: xelatex
+    toc: no
+  html_document:
+    theme: united
+    toc: yes
+  md_document:
+    variant: markdown
+    dev: svg
+    fig_width: 12
+    fig_height: 6.75
+---
+
+# Introduction
+
+I’ve been [brewing beer](https://swingley.org/brewing/recipe_list.php) since the
+[early 90s](https://swingley.org/brewing/old_listing.php), and since those days
+the number of hops available to homebrewers has gone from what seems like a
+handfull of varieties (Northern Brewer, Goldings, Fuggle, Willamette, Cluster)
+to well over a hundred.  Whenever I go to my local brewing store I’m bewildered
+by the large variety of hops, most of which I’ve never heard of.  I’m also not
+all that fond of super-citrusy hops like Cascade or it’s variants, so the
+challenge is always to find flavor and aroma hops that aren’t citrusy among the
+several dozen new varieties on display.
+
+Most of the hops at the store are [Yakima Chief – Hop
+Union](http://ychhops.com/) branded, and they’ve got a great web site that lists
+all their varieties and has a lot of useful information about each hop.  As
+convenient as a website can be, I’d rather have the data in a database where I
+can search and organize it myself.  Since the data is all on the website, we can
+use a web scraping library to grab it and format it however we like.
+
+One note: websites change all the time, so whenever the structure of a site
+changes, the code to grab the data will need to be updated.  I originally wrote
+the code for this post a couple weeks ago, scraping data from the Hop Union web
+site.  This morning, that site had been replaced with an entirely different
+Yakima Chief – Hop Union site and I had to rewrite the code.
+
+# rvest
+
+I’m using the [rvest](https://cran.r-project.org/web/packages/rvest/index.html)
+package from Hadley Wickham and RStudio to do the work of pulling the data from
+each page.  In the Python world, [Beautiful
+Soup](http://www.crummy.com/software/BeautifulSoup/) would be the library I’d
+use, but there’s a fair amount of data manipulation needed here and I felt like
+[dplyr](https://cran.rstudio.com/web/packages/dplyr/vignettes/introduction.html)
+would be easier.
+
+# Process
+
+First, load all the libraries we need.  Note that you have to load `plyr` before
+`dplyr` because they define functions with the same names and there would be a
+conflict otherwise.  The only function I need from `plyr` is `rbind.fill`, so
+that shouldn't be an issue.  I couldn’t come up with a pure-`dplyr` way of
+combining data frame rows with different columns.
+
+```{r echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE}
+library(rvest)       # scraping data from the web
+library(dplyr)       # manipulation, filtering, grouping into tables
+library(stringr)     # string functions
+library(tidyr)       # creating columns from rows
+library(RPostgreSQL) # dump final result to a PostgreSQL database
+```
+
+Next, we retrieve the data from the main page that has all the varieties listed
+on it, and extract the list of links to each hop.  In the code below, I read the
+entire document into a variable, `hop_varieties` using the `read_html function`.
+
+Once I've got the web page, I need to find the HTML nodes that contain links to
+the page for each individual hop.  To do that, you use `html_nodes()`, passing a
+CSS selector to the function.  In this case, I'm looking for `a` tags that have
+a class of `card__name`.  I figured this out by looking at the raw source code
+from the page using my web browser’s inspection tools.  If you right-click on
+what looks like a like on the page, one of the options in the pop-up menu is
+“inspect”, and when you choose that, it will show you the HTML for the element
+you clicked on.  It can take a few tries to find the proper combination of tag,
+class, attribute or id to uniquely identify the things you want.
+
+The YCH site is pretty well organized, so this isn’t too difficult.  Once we’ve
+got the nodes, we extract the links by retrieving the `href` attribute from each
+one with `html_attr()`.
+
+```{r echo=TRUE, eval=FALSE, message=FALSE, warning=FALSE}
+hop_varieties <- read_html("http://ychhops.com/varieties")
+
+hop_page_links <- hop_varieties %>%
+    html_nodes("a.card__name") %>%
+    html_attr("href")
+```
+
+Now we have a list of links to all the varieties on the page.  It turns out that
+they made a mistake when they transitioned to the new site and the links all
+have the wrong host (`ych.craft.dev`).  We can fix that by applying replacing
+the host in all the links.
+
+```{r echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE}
+fixed_links <- sapply(hop_page_links,
+                     FUN=function(x) sub('ych.craft.dev',
+                                         'ychhops.com', x)) %>%
+    as.vector()
+```
+
+Each page will need to be loaded, the relevant information extracted, and the
+data formatted into a suitable data structure.  I think a data frame is the best
+format for this, where each row in the data frame represents the data for a
+single hop and each column is a piece of information from the web page.
+
+First we write a function the retrieves the data for a single hop and returns a
+one-row data frame with that data.  Most of the data is pretty simple, with a
+single value for each hop.  Name, description, type of hop, etc.  Where it gets
+more complicated is the each hop can have more than one aroma category, and the
+statistics for each hop vary from one to the next.  What I've done here is
+combine the aromas together into a single string, using the at symbol (`@`) to
+separate the parts.  Since it's unlikely that symbol will appear in the data, we
+can split it back apart later.  We do the same thing for the other parameters,
+creating an `@`-delimited string for the items, and their values.
+
+```{r echo=TRUE, eval=FALSE, message=FALSE, warning=FALSE}
+get_hop_stats <- function(p) {
+    hop_page <- read_html(p)
+
+    hop_name <- hop_page %>%
+        html_nodes('h1[itemprop="name"]') %>%
+        html_text()
+
+    type <- hop_page %>%
+        html_nodes('div.hop-profile__data div[itemprop="additionalProperty"]') %>%
+        html_text()
+    type <- (str_split(type, ' '))[[1]][2]
+
+    region <- hop_page %>%
+        html_nodes('div.hop-profile__data h5') %>%
+        html_text()
+
+    description <- hop_page %>%
+        html_nodes('div.hop-profile__profile p[itemprop="description"]') %>%
+        html_text()
+
+    aroma_profiles <- hop_page %>%
+        html_nodes('div.hop-profile__profile h3.headline a[itemprop="category"]') %>%
+        html_text()
+
+    aroma_profiles <- sapply(aroma_profiles,
+                             FUN=function(x) sub(',$', '', x)) %>%
+        as.vector() %>%
+        paste(collapse="@")
+
+    composition_keys <- hop_page %>%
+        html_nodes('div.hop-composition__item') %>%
+        html_text()
+
+    composition_keys <- sapply(composition_keys,
+                               FUN=function(x)
+                                   tolower(gsub('[ -]', '_', x))) %>%
+        as.vector() %>%
+        paste(collapse="@")
+
+    composition_values <- hop_page %>%
+        html_nodes('div.hop-composition__value') %>%
+        html_text() %>%
+        paste(collapse="@")
+
+    hop <- data.frame('hop'=hop_name, 'type'=type, 'region'=region,
+                      'description'=description,
+                      'aroma_profiles'=aroma_profiles,
+                      'composition_keys'=composition_keys,
+                      'composition_values'=composition_values)
+
+}
+```
+
+With a function that takes a URL as input, and returns a single-row data frame,
+we use a common idiom in R to combine everything together.  The inner-most
+`lapply` function will run the function on each of the fixed variety links, and
+each single-row data frame will then be combined together using `rbind` within
+`do.call`.
+
+```{r echo=TRUE, eval=FALSE, message=FALSE, warning=FALSE}
+all_hops <- do.call(rbind,
+                    lapply(fixed_links, get_hop_stats)) %>% tbl_df() %>%
+    arrange(hop) %>%
+    mutate(id=row_number())
+```
+```{r echo=FALSE, eval=FALSE, message=FALSE, warning=FALSE}
+save(all_hops, file="ych_all_hops.rdata")
+```
+```{r echo=FALSE, eval=TRUE, message=FALSE, warning=FALSE}
+load("ych_all_hops.rdata")
+```
+
+At this stage we've retrieved all the data from the website, but some of it has
+been encoded in a less that useful format.
+
+# Data tidying
+
+To tidy the data, I want to extract only a few of the item / value pairs of data
+from the data frame, alpha acid, beta acid, co-humulone and total oil.  I also
+need to remove carriage returns from the description and remove the aroma
+column.
+
+We split the keys and values back apart again using the `@` symbol used earlier
+to combine them, then use `unnest` to create duplicate columns with each of the
+key / value pairs in them.  `spread` pivots these up into columns such that the
+end result has one row per hop with the relevant composition values as columns
+in the tidy data set.
+
+```{r echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE}
+hops <- all_hops %>%
+    arrange(hop) %>%
+    mutate(description=gsub('\\r', '', description),
+           keys=str_split(composition_keys, "@"),
+           values=str_split(composition_values, "@")) %>%
+    unnest(keys, values) %>%
+    spread(keys, values) %>%
+    select(id, hop, type, region, alpha_acid, beta_acid, co_humulone, total_oil, description)
+
+kable(hops %>% select(id, hop, type, region, alpha_acid) %>% head())
+```
+
+For the aromas we have a one to many relationship where each hop has one or more
+aroma categories associated.  We could fully normalize this by created an aroma
+table and a join table that connects hop and aroma, but this data is simple
+enough that I just created the join table itself.  We're using the same
+`str_split` / `unnest` method we used before, except that in this case we don't
+want to turn those into columns, we *want* a separate row for each hop × aroma
+combination.
+
+```{r echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE}
+hops_aromas <- all_hops %>%
+    select(id, hop, aroma_profiles) %>%
+    mutate(aroma=str_split(aroma_profiles, "@")) %>%
+    unnest(aroma) %>%
+    select(id, hop, aroma)
+```
+
+# Saving and exporting
+
+Finally, we save the data and export it into a PostgreSQL database.
+
+```{r echo=TRUE, eval=FALSE, message=FALSE, warning=FALSE}
+save(list=c("hops", "hops_aromas"),
+     file="ych_hops.rdata")
+
+beer <- src_postgres(host="example", dbname="beer",
+                     port=5432, user="username")
+
+dbWriteTable(beer$con, "ych_hops", hops %>% data.frame(), row.names=FALSE)
+dbWriteTable(beer$con, "ych_hops_aromas", hops_aromas %>% data.frame(), row.names=FALSE)
+```
+
+# Usage
+
+I created a view in the database that combines all the aroma categories into a
+Postgres array type using this query.  I also use a pair of regular expressions
+to convert the alpha acid string into a Postgres numrange.
+
+```{sql}
+CREATE VIEW ych_basic_hop_data AS
+SELECT ych_hops.id, ych_hops.hop, array_agg(aroma) AS aromas, type,
+    numrange(
+        regexp_replace(alpha_acid, '([0-9.]+).*', E'\\1')::numeric,
+        regexp_replace(alpha_acid, '.*- ([0-9.]+)%', E'\\1')::numeric,
+        '[]') AS alpha_acid_percent, description
+FROM ych_hops
+    INNER JOIN ych_hops_aromas USING(id)
+GROUP BY ych_hops.id, ych_hops.hop, type, alpha_acid, description
+ORDER BY hop;
+```
+
+With this, we can find US aroma hops that are spicy, but without citrus:
+
+```{sql}
+SELECT hop, region, type, aromas, alpha_acid_percent
+FROM ych_basic_hop_data
+WHERE type = 'Aroma' AND region = 'Pacific Northwest' AND 'Spicy' = ANY(aromas)
+AND 'Citrus' != ALL(aromas) ORDER BY alpha_acid_percent;
+
+     hop    |      region       | type  |            aromas            | alpha_acid_percent
+ -----------+-------------------+-------+------------------------------+--------------------
+  Crystal   | Pacific Northwest | Aroma | {Floral,Spicy}               | [3,6]
+  Hallertau | Pacific Northwest | Aroma | {Floral,Spicy,Herbal}        | [3.5,6.5]
+  Tettnang  | Pacific Northwest | Aroma | {Earthy,Floral,Spicy,Herbal} | [4,6]
+  Mt. Hood  | Pacific Northwest | Aroma | {Spicy,Herbal}               | [4,6.5]
+  Santiam   | Pacific Northwest | Aroma | {Floral,Spicy,Herbal}        | [6,8.5]
+  Ultra     | Pacific Northwest | Aroma | {Floral,Spicy}               | [9.2,9.7]
+```
+
+<!-- vim: set ft=rmd fenc=utf-8 tw=80 ts=4 sw=4 sts=4: -->
